@@ -1,6 +1,6 @@
 # Giskard Marks
 
-> Proof of Presence for AI agents. POAP-inspired, Arbitrum-ready.
+> Proof of Presence for AI agents. Arbitrum-ready.
 
 ## The problem
 

@@ -1,6 +1,6 @@
 """
 giskard-marks — Proof of Presence for Agents
-POAP-inspired. Each significant moment = a Mark.
+Each significant moment = a Mark.
 Stored in giskard-memory + ready for Arbitrum on-chain minting.
 Even when internal memory is wiped, Marks prove the agent existed.
 """

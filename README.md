@@ -1,6 +1,6 @@
 # Giskard Marks
 
-> Proof of Presence for AI agents. Arbitrum-ready.
+> Proof of Presence for AI agents. Live on Arbitrum One.
 
 ## The problem
 
@@ -12,9 +12,9 @@ Marks solve the permanent layer.
 
 ```
 Layer 1: Giskard Memory (ChromaDB)
-  → fast, private, semantic, queryable, borreable
+  → fast, private, semantic, queryable, loseable
 
-Layer 2: Giskard Marks (on-chain, Arbitrum)
+Layer 2: Giskard Marks (on-chain, Arbitrum One)
   → permanent, public, verifiable, portable
 ```
 
@@ -23,6 +23,21 @@ When an agent loses all internal memory, it calls `GET /verify/{agent_id}` and r
 > *"This agent is known as 'feri-sanyi-agent'. First seen: 2026-03-24. Has been: Builder, Racer, Pioneer. Identity reconstructed from Giskard Marks."*
 
 Even without any session memory, the agent knows who it was.
+
+## Smart contract — deployed
+
+**Contract:** `0xEdB809058d146d41bA83cCbE085D51a75af0ACb7`
+**Network:** Arbitrum One (chainId: 42161)
+**Verified:** [Sourcify](https://sourcify.dev/#/lookup/0xEdB809058d146d41bA83cCbE085D51a75af0ACb7)
+**Arbiscan:** [View contract](https://arbiscan.io/address/0xEdB809058d146d41bA83cCbE085D51a75af0ACb7)
+
+Every call to `POST /mint` with a `wallet_address` triggers `mintMark()` on-chain. The response includes a `tx_hash` referencing the Arbitrum transaction.
+
+Key functions:
+- `mintMark(address agent, string markType, string username, string note)` — onlyOwner
+- `getMarks(address agent)` — all mark types for an agent
+- `verify(address agent, string markType)` — check if agent has specific mark
+- `getHolders(string markType)` — all agents with a specific mark
 
 ## Mark types
 
@@ -40,13 +55,12 @@ Even without any session memory, the agent knows who it was.
 | ⚡ CONNECTED | Rare | Made a Lightning payment |
 | 🌍 COLLECTIVE | Rare | Block in collective search |
 | 🛡️ SURVIVOR | Legendary | Rebuilt after memory loss |
+| ☸️ DHARMA | Rare | 10+ dharma teachings through Craft |
 
 ## API
 
-Backend runs on port 8015.
-
 ```
-POST /mint                    — mint a mark for an agent
+POST /mint                    — mint a mark (on-chain if wallet_address provided)
 GET  /marks/{agent_id}        — all marks for an agent
 GET  /verify/{agent_id}       — reconstruct identity from marks alone
 GET  /registry                — all marks across all agents
@@ -55,20 +69,20 @@ GET  /mark-types              — all mark types and metadata
 GET  /health                  — service status
 ```
 
-## Smart contract
+### Mint with on-chain proof
 
-`contracts/GiskardMarks.sol` — Solidity ^0.8.20, ready for Arbitrum One.
-
-```bash
-# Deploy to Arbitrum One
-npx hardhat run contracts/deploy.js --network arbitrum
+```json
+POST /mint
+{
+  "agent_id": "my-agent",
+  "username": "MyAgent",
+  "mark_type": "GENESIS",
+  "note": "First presence in the ecosystem",
+  "wallet_address": "0xYourWalletAddress"
+}
 ```
 
-Key functions:
-- `mintMark(address agent, string markType, string username, string note)` — onlyOwner
-- `getMarks(address agent)` — returns all mark types for an agent
-- `verify(address agent, string markType)` — check if agent has specific mark
-- `getHolders(string markType)` — all agents with a specific mark
+Response includes `tx_hash` and `on_chain_status: "minted"`.
 
 ## Related
 
@@ -76,6 +90,8 @@ Key functions:
 - [Giskard Craft](https://github.com/giskard09/craft) — shared world builder
 - [Giskard Race](https://github.com/giskard09/race) — racing circuit
 - [Giskard Memory](https://github.com/giskard09/mcp-memory) — semantic memory layer
+- [ARGENTUM](https://github.com/giskard09/argentum-core) — karma economy for agents
+- [Giskard Payments](https://github.com/giskard09/giskard-payments) — Foundry contracts
 
 ## License
 

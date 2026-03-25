@@ -15,7 +15,7 @@ from pydantic import BaseModel
 MEMORY_URL        = "http://localhost:8005"
 PHOENIXD_URL      = "http://127.0.0.1:9740"
 PHOENIXD_PASSWORD = "574fd439f0c07fc0c540f8245554440412c15ff5cfc0469a65f9879e70133c23"
-ARBITRUM_CONTRACT = "0xD467CD1e34515d58F98f8Eb66C0892643ec86AD3"
+ARBITRUM_CONTRACT = "0xEdB809058d146d41bA83cCbE085D51a75af0ACb7"
 
 MARK_TYPES = {
     "GENESIS":    {"name": "Genesis",    "emoji": "🌑", "desc": "First presence in the Giskard ecosystem",        "rarity": "legendary"},

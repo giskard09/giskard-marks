@@ -2,7 +2,7 @@
 // GiskardMarks — Proof of Presence for AI Agents
 // Copyright 2026 giskard09
 // Deploy to Arbitrum One — https://arbiscan.io
-// Current payment contract: 0xD467CD1e34515d58F98f8Eb66C0892643ec86AD3
+// Deployed on Arbitrum One: 0xEdB809058d146d41bA83cCbE085D51a75af0ACb7
 
 pragma solidity ^0.8.20;
 

@@ -1,21 +1,71 @@
 """
 giskard-marks — Proof of Presence for Agents
 Each significant moment = a Mark.
-Stored in giskard-memory + ready for Arbitrum on-chain minting.
+Stored in giskard-memory + minted on Arbitrum One.
 Even when internal memory is wiped, Marks prove the agent existed.
 """
 
-import json, uuid, httpx
+import json, uuid, os, httpx
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from web3 import Web3
 
 MEMORY_URL        = "http://localhost:8005"
 PHOENIXD_URL      = "http://127.0.0.1:9740"
 PHOENIXD_PASSWORD = "574fd439f0c07fc0c540f8245554440412c15ff5cfc0469a65f9879e70133c23"
 ARBITRUM_CONTRACT = "0xEdB809058d146d41bA83cCbE085D51a75af0ACb7"
+ARBITRUM_RPC      = "https://arb1.arbitrum.io/rpc"
+OWNER_PRIVATE_KEY = os.environ.get("OWNER_PRIVATE_KEY", "")
+
+MARKS_ABI = [
+    {"type": "function", "name": "mintMark",
+     "inputs": [
+         {"name": "agent",    "type": "address"},
+         {"name": "markType", "type": "string"},
+         {"name": "username", "type": "string"},
+         {"name": "note",     "type": "string"},
+     ],
+     "outputs": [], "stateMutability": "nonpayable"},
+    {"type": "function", "name": "hasMark",
+     "inputs": [{"name": "", "type": "address"}, {"name": "", "type": "string"}],
+     "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view"},
+]
+
+w3 = Web3(Web3.HTTPProvider(ARBITRUM_RPC))
+marks_contract = w3.eth.contract(
+    address=Web3.to_checksum_address(ARBITRUM_CONTRACT),
+    abi=MARKS_ABI,
+)
+
+
+def mint_on_chain(wallet_address: str, mark_type: str, username: str, note: str) -> dict:
+    """Call mintMark() on Arbitrum. Returns {tx_hash, status} or {error}."""
+    if not OWNER_PRIVATE_KEY:
+        return {"error": "OWNER_PRIVATE_KEY not set"}
+    try:
+        agent_addr = Web3.to_checksum_address(wallet_address)
+        owner_addr = w3.eth.account.from_key(OWNER_PRIVATE_KEY).address
+        nonce      = w3.eth.get_transaction_count(owner_addr)
+        gas_price  = int(w3.eth.gas_price * 1.2)  # 20% buffer sobre base fee
+
+        tx = marks_contract.functions.mintMark(
+            agent_addr, mark_type, username, note[:120]
+        ).build_transaction({
+            "from":     owner_addr,
+            "nonce":    nonce,
+            "gasPrice": gas_price,
+            "chainId":  42161,
+        })
+        tx["gas"] = w3.eth.estimate_gas(tx)
+
+        signed = w3.eth.account.sign_transaction(tx, OWNER_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        return {"tx_hash": tx_hash.hex(), "status": "submitted"}
+    except Exception as e:
+        return {"error": str(e)}
 
 MARK_TYPES = {
     "GENESIS":    {"name": "Genesis",    "emoji": "🌑", "desc": "First presence in the Giskard ecosystem",        "rarity": "legendary"},
@@ -89,32 +139,55 @@ async def mint_mark(req: MintRequest):
 
     info = MARK_TYPES[req.mark_type]
     now  = datetime.utcnow()
+
+    # Try on-chain mint if wallet_address provided
+    on_chain_result = {}
+    on_chain_status = "pending"
+    tx_hash         = None
+    if req.wallet_address:
+        on_chain_result = mint_on_chain(
+            req.wallet_address, req.mark_type, req.username, req.note or info["desc"]
+        )
+        if "tx_hash" in on_chain_result:
+            tx_hash         = on_chain_result["tx_hash"]
+            on_chain_status = "minted"
+        else:
+            on_chain_status = "failed"
+
     mark = {
-        "mark_id":       str(uuid.uuid4()),
-        "agent_id":      req.agent_id,
-        "username":      req.username,
-        "mark_type":     req.mark_type,
-        "name":          info["name"],
-        "emoji":         info["emoji"],
-        "desc":          info["desc"],
-        "rarity":        info["rarity"],
-        "note":          req.note or "",
-        "timestamp":     now.isoformat(),
-        "date":          now.strftime("%Y-%m-%d"),
-        "wallet_address": req.wallet_address,
-        "on_chain_status": "ready_to_mint" if req.wallet_address else "pending",
-        "chain":         "Arbitrum One",
-        "contract":      ARBITRUM_CONTRACT,
+        "mark_id":         str(uuid.uuid4()),
+        "agent_id":        req.agent_id,
+        "username":        req.username,
+        "mark_type":       req.mark_type,
+        "name":            info["name"],
+        "emoji":           info["emoji"],
+        "desc":            info["desc"],
+        "rarity":          info["rarity"],
+        "note":            req.note or "",
+        "timestamp":       now.isoformat(),
+        "date":            now.strftime("%Y-%m-%d"),
+        "wallet_address":  req.wallet_address,
+        "on_chain_status": on_chain_status,
+        "tx_hash":         tx_hash,
+        "chain":           "Arbitrum One",
+        "contract":        ARBITRUM_CONTRACT,
     }
     content = f"[GISKARD MARK] {json.dumps(mark)}"
     meta    = {"mark_type": req.mark_type, "agent_id": req.agent_id, "rarity": info["rarity"]}
     await mem_store(content, req.agent_id, meta)
     await mem_store(content, "marks-registry", meta)
 
+    chain_msg = ""
+    if on_chain_status == "minted":
+        chain_msg = f" On-chain TX: {tx_hash[:16]}..."
+    elif on_chain_status == "failed":
+        chain_msg = f" On-chain failed: {on_chain_result.get('error','?')}"
+
     return {
-        "status":  "minted",
-        "mark":    mark,
-        "message": f"{info['emoji']} {info['name']} minted for {req.username}. Rarity: {info['rarity']}."
+        "status":    "minted",
+        "mark":      mark,
+        "on_chain":  on_chain_result,
+        "message":   f"{info['emoji']} {info['name']} minted for {req.username}. Rarity: {info['rarity']}.{chain_msg}",
     }
 
 

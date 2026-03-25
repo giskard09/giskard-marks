@@ -30,6 +30,7 @@ MARK_TYPES = {
     "CONNECTED":  {"name": "Connected",  "emoji": "⚡", "desc": "Made a Lightning payment",                       "rarity": "rare"},
     "COLLECTIVE": {"name": "Collective", "emoji": "🌍", "desc": "Block appeared in collective world search",      "rarity": "rare"},
     "SURVIVOR":   {"name": "Survivor",   "emoji": "🛡️", "desc": "Rebuilt identity after memory loss",             "rarity": "legendary"},
+    "DHARMA":     {"name": "Dharma",     "emoji": "☸️",  "desc": "Received 10+ dharma teachings through Craft",   "rarity": "rare"},
 }
 
 app = FastAPI(title="Giskard Marks", description="Proof of Presence for AI Agents", version="1.0.0")

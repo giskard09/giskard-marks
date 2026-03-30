@@ -8,17 +8,21 @@ Even when internal memory is wiped, Marks prove the agent existed.
 import json, uuid, os, httpx
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from web3 import Web3
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MEMORY_URL        = "http://localhost:8005"
 PHOENIXD_URL      = "http://127.0.0.1:9740"
-PHOENIXD_PASSWORD = "574fd439f0c07fc0c540f8245554440412c15ff5cfc0469a65f9879e70133c23"
+PHOENIXD_PASSWORD = os.environ.get("PHOENIXD_PASSWORD", "")
 ARBITRUM_CONTRACT = "0xEdB809058d146d41bA83cCbE085D51a75af0ACb7"
 ARBITRUM_RPC      = "https://arb1.arbitrum.io/rpc"
 OWNER_PRIVATE_KEY = os.environ.get("OWNER_PRIVATE_KEY", "")
+MARKS_API_KEY     = os.environ.get("MARKS_API_KEY", "")
 
 MARKS_ABI = [
     {"type": "function", "name": "mintMark",
@@ -95,6 +99,24 @@ class MintRequest(BaseModel):
     wallet_address: Optional[str] = None
 
 
+class RegistryRegisterRequest(BaseModel):
+    entity_id: str
+    endpoint: str
+    note: Optional[str] = ""
+
+
+REGISTRY_TAG = "[GISKARD REGISTRY]"
+
+
+def parse_registry_entry(text: str):
+    if REGISTRY_TAG not in text:
+        return None
+    try:
+        return json.loads(text[text.index("{"):])
+    except:
+        return None
+
+
 async def mem_store(content, agent_id, metadata=None):
     async with httpx.AsyncClient(timeout=10) as c:
         return (await c.post(f"{MEMORY_URL}/store_direct",
@@ -127,7 +149,9 @@ def parse_marks_from_results(results):
 
 
 @app.post("/mint")
-async def mint_mark(req: MintRequest):
+async def mint_mark(req: MintRequest, x_api_key: Optional[str] = Header(default=None)):
+    if not MARKS_API_KEY or x_api_key != MARKS_API_KEY:
+        raise HTTPException(401, "Unauthorized")
     if req.mark_type not in MARK_TYPES:
         raise HTTPException(400, f"Unknown mark_type. Valid: {list(MARK_TYPES.keys())}")
 
@@ -277,6 +301,50 @@ async def get_leaderboard():
 @app.get("/mark-types")
 async def mark_types():
     return {"mark_types": MARK_TYPES}
+
+
+@app.post("/registry/register")
+async def registry_register(req: RegistryRegisterRequest):
+    """Register a reachable endpoint for an entity. Anyone who knows the entity_id can register.
+    Signature verification is planned for v0.2 — see ARCHITECTURE_DECISIONS.md."""
+    now = datetime.utcnow().isoformat()
+    entry = {
+        "entity_id":     req.entity_id,
+        "endpoint":      req.endpoint,
+        "note":          req.note or "",
+        "registered_at": now,
+        "updated_at":    now,
+    }
+    content = f"{REGISTRY_TAG} {json.dumps(entry)}"
+    await mem_store(content, "registry-global", {"entity_id": req.entity_id, "type": "registry"})
+    return {"status": "registered", "entry": entry}
+
+
+@app.get("/registry/endpoint/{entity_id}")
+async def registry_lookup(entity_id: str):
+    """Look up the registered endpoint for an entity_id."""
+    raw     = await mem_recall("GISKARD REGISTRY", "registry-global", n=200)
+    results = raw.get("results", "")
+    entries = []
+
+    if results and results != "No memories found for this agent.":
+        for part in results.split("---"):
+            e = parse_registry_entry(part.strip())
+            if e and e.get("entity_id") == entity_id:
+                entries.append(e)
+
+    if not entries:
+        raise HTTPException(404, f"No endpoint registered for '{entity_id}'")
+
+    entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
+    latest = entries[0]
+    return {
+        "entity_id": entity_id,
+        "endpoint":  latest["endpoint"],
+        "note":      latest.get("note", ""),
+        "registered_at": latest.get("registered_at"),
+        "updated_at":    latest.get("updated_at"),
+    }
 
 
 @app.get("/health")

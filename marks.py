@@ -5,7 +5,8 @@ Stored in giskard-memory + minted on Arbitrum One.
 Even when internal memory is wiped, Marks prove the agent existed.
 """
 
-import json, uuid, os, httpx
+import json, uuid, os, time, httpx
+_started_at = time.time()
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Header
@@ -344,6 +345,28 @@ async def registry_lookup(entity_id: str):
         "note":      latest.get("note", ""),
         "registered_at": latest.get("registered_at"),
         "updated_at":    latest.get("updated_at"),
+    }
+
+
+@app.get("/status")
+async def get_status():
+    """Estado del servicio: nombre, versión, uptime, puerto, salud, dependencias.
+    Read-only, gratis. Útil para monitoreo y health checks."""
+    try:
+        raw = await mem_recall("[GISKARD MARK]", "marks-registry", n=200)
+        total = len(parse_marks_from_results(raw.get("results", "")))
+        healthy = True
+    except Exception:
+        total = None
+        healthy = False
+    return {
+        "service": "giskard-marks",
+        "version": "1.0.0",
+        "port": 8015,
+        "uptime_seconds": int(time.time() - _started_at),
+        "healthy": healthy,
+        "dependencies": ["giskard-memory", "arbitrum-rpc"],
+        "total_marks": total,
     }
 
 

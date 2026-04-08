@@ -42,7 +42,7 @@ jobs:
       - name: Audit — no hardcoded credentials in tracked files
         run: |
           for pattern in "PRIVATE_KEY=" "API_KEY=" "SECRET=" "PASSWORD="; do
-            hits=$(git ls-files -z | xargs -0 grep -l "$pattern" 2>/dev/null | grep -v ".env" || true)
+            hits=$(git ls-files -z | xargs -0 grep -l "$pattern" 2>/dev/null | grep -v ".env" | grep -v ".github/workflows/" || true)
             if [ -n "$hits" ]; then
               echo "FAIL: $pattern found in tracked file: $hits"
               exit 1

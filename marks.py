@@ -106,11 +106,26 @@ class RegistryRegisterRequest(BaseModel):
     note: Optional[str] = ""
 
 
+class PubKeyRegisterRequest(BaseModel):
+    agent_id: str
+    pub_key: str  # base64 Ed25519 verify key (32 bytes raw)
+
+
 REGISTRY_TAG = "[GISKARD REGISTRY]"
+PUBKEY_TAG   = "[GISKARD PUBKEY]"
 
 
 def parse_registry_entry(text: str):
     if REGISTRY_TAG not in text:
+        return None
+    try:
+        return json.loads(text[text.index("{"):])
+    except:
+        return None
+
+
+def parse_pubkey_entry(text: str):
+    if PUBKEY_TAG not in text:
         return None
     try:
         return json.loads(text[text.index("{"):])
@@ -346,6 +361,47 @@ async def registry_lookup(entity_id: str):
         "registered_at": latest.get("registered_at"),
         "updated_at":    latest.get("updated_at"),
     }
+
+
+@app.post("/pubkey/register")
+async def pubkey_register(req: PubKeyRegisterRequest):
+    """Register an Ed25519 public key for an agent_id. First-write-wins:
+    once registered, the key is permanent (rotation is a future concern).
+    Used by karma_pricing.py to verify signed requests."""
+    import base64 as _b64
+    try:
+        raw = _b64.b64decode(req.pub_key)
+        if len(raw) != 32:
+            raise HTTPException(400, "pub_key must be 32 bytes (Ed25519 verify key)")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "pub_key must be valid base64")
+
+    existing_raw = await mem_recall(PUBKEY_TAG, "pubkey-registry", n=500)
+    for part in existing_raw.get("results", "").split("---"):
+        e = parse_pubkey_entry(part.strip())
+        if e and e.get("agent_id") == req.agent_id:
+            if e.get("pub_key") == req.pub_key:
+                return {"status": "already_registered", "entry": e}
+            raise HTTPException(409, f"pub_key already registered for '{req.agent_id}'")
+
+    now = datetime.utcnow().isoformat()
+    entry = {"agent_id": req.agent_id, "pub_key": req.pub_key, "registered_at": now}
+    content = f"{PUBKEY_TAG} {json.dumps(entry)}"
+    await mem_store(content, "pubkey-registry", {"agent_id": req.agent_id, "type": "pubkey"})
+    return {"status": "registered", "entry": entry}
+
+
+@app.get("/pubkey/{agent_id}")
+async def pubkey_lookup(agent_id: str):
+    """Return the Ed25519 pub_key registered for this agent_id, or 404."""
+    raw = await mem_recall(PUBKEY_TAG, "pubkey-registry", n=500)
+    for part in raw.get("results", "").split("---"):
+        e = parse_pubkey_entry(part.strip())
+        if e and e.get("agent_id") == agent_id:
+            return {"agent_id": agent_id, "pub_key": e["pub_key"], "registered_at": e.get("registered_at")}
+    raise HTTPException(404, f"No pub_key registered for '{agent_id}'")
 
 
 @app.get("/status")

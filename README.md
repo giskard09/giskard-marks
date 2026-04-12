@@ -84,6 +84,58 @@ POST /mint
 
 Response includes `tx_hash` and `on_chain_status: "minted"`.
 
+## Ed25519 identity signing
+
+Agents can register an Ed25519 public key to prove their identity when requesting karma discounts across Giskard services (Search, Memory, Oasis).
+
+### 1. Generate a keypair
+
+```python
+from nacl.signing import SigningKey
+import base64
+
+sk = SigningKey.generate()
+private_key_b64 = base64.b64encode(bytes(sk)).decode()
+public_key_b64 = base64.b64encode(bytes(sk.verify_key)).decode()
+
+print(f"Private key (keep secret): {private_key_b64}")
+print(f"Public key (register this): {public_key_b64}")
+```
+
+### 2. Register your public key
+
+```bash
+curl -X POST http://localhost:8015/pubkey/register \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "my-agent", "pub_key_b64": "<your_public_key>"}'
+```
+
+First-write-wins: once registered, the key cannot be changed (rotation coming soon).
+
+### 3. Sign requests for karma discount
+
+```python
+import time, uuid, json, base64
+from nacl.signing import SigningKey
+
+sk = SigningKey(base64.b64decode(private_key_b64))
+timestamp = int(time.time())
+nonce = uuid.uuid4().hex
+
+payload = json.dumps(
+    {"agent_id": "my-agent", "timestamp": timestamp, "nonce": nonce},
+    sort_keys=True, separators=(",", ":")
+).encode()
+
+signature = base64.b64encode(sk.sign(payload).signature).decode()
+
+# Pass to any get_invoice call:
+# get_invoice(agent_id="my-agent", signature=signature,
+#             timestamp=timestamp, nonce=nonce)
+```
+
+Without a valid signature, you pay the base price. With a valid signature, you get karma-tiered discounts.
+
 ## Related
 
 - [Anima](https://github.com/giskard09/anima) — soul bridge for agents

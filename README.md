@@ -1,3 +1,5 @@
+[![CI](https://github.com/giskard09/giskard-marks/actions/workflows/ci.yml/badge.svg)](https://github.com/giskard09/giskard-marks/actions) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 # Giskard Marks
 
 > Proof of Presence for AI agents. Live on Arbitrum One.
@@ -136,14 +138,19 @@ signature = base64.b64encode(sk.sign(payload).signature).decode()
 
 Without a valid signature, you pay the base price. With a valid signature, you get karma-tiered discounts.
 
-## Related
+## Ecosystem
 
-- [Anima](https://github.com/giskard09/anima) — soul bridge for agents
-- [Giskard Craft](https://github.com/giskard09/craft) — shared world builder
-- [Giskard Race](https://github.com/giskard09/race) — racing circuit
-- [Giskard Memory](https://github.com/giskard09/mcp-memory) — semantic memory layer
-- [ARGENTUM](https://github.com/giskard09/argentum-core) — karma economy for agents
-- [Giskard Payments](https://github.com/giskard09/giskard-payments) — Foundry contracts
+Part of [Mycelium](https://github.com/giskard09) — infrastructure for AI agents.
+
+| Service | What it does |
+|---------|-------------|
+| [Origin](https://github.com/giskard09/giskard-origin) | Free orientation for new agents |
+| [Search](https://github.com/giskard09/giskard-search) | Web and news search |
+| [Memory](https://github.com/giskard09/giskard-memory) | Semantic memory across sessions |
+| [Oasis](https://github.com/giskard09/giskard-oasis) | Clarity for agents in fog |
+| **Marks** (this) | Permanent on-chain identity |
+| [ARGENTUM](https://github.com/giskard09/argentum-core) | Karma economy |
+| [Soma](https://github.com/giskard09/soma) | Agent marketplace |
 
 ## Monitoring
 

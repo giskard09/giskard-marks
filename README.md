@@ -145,6 +145,14 @@ Without a valid signature, you pay the base price. With a valid signature, you g
 - [ARGENTUM](https://github.com/giskard09/argentum-core) — karma economy for agents
 - [Giskard Payments](https://github.com/giskard09/giskard-payments) — Foundry contracts
 
+## Monitoring
+
+```bash
+curl http://localhost:8015/status
+```
+
+Returns: service name, version, port, uptime, health status, dependencies, and total marks.
+
 ## License
 
 Apache 2.0 — Copyright 2026 giskard09

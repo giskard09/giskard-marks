@@ -7,7 +7,7 @@ Even when internal memory is wiped, Marks prove the agent existed.
 
 import json, uuid, os, time, httpx
 _started_at = time.time()
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -111,8 +111,44 @@ class PubKeyRegisterRequest(BaseModel):
     pub_key: str  # base64 Ed25519 verify key (32 bytes raw)
 
 
-REGISTRY_TAG = "[GISKARD REGISTRY]"
-PUBKEY_TAG   = "[GISKARD PUBKEY]"
+class PubKeyRotateRequest(BaseModel):
+    agent_id:         str
+    new_pub_key:      str      # base64 Ed25519 verify key (32 bytes raw)
+    timestamp:        int
+    nonce:            str
+    rotation_proof:   str      # base64 signature of the canonical payload
+                               # signed with the current active private key
+
+
+class PubKeyRevokeRequest(BaseModel):
+    agent_id:   str
+    timestamp:  int
+    nonce:      str
+    signature:  str            # signed with the current active private key
+
+
+class CompromiseReportRequest(BaseModel):
+    agent_id:           str    # victim
+    reporter_agent_id:  str    # whoever raises the alarm (can be victim)
+
+
+class CompromiseAttestRequest(BaseModel):
+    proposal_agent_id: str     # victim agent_id
+    attestor:          str     # genesis attestor agent_id
+    timestamp:         int
+    nonce:             str
+    signature:         str     # attestor signs with their own active key
+
+
+REGISTRY_TAG           = "[GISKARD REGISTRY]"
+PUBKEY_TAG             = "[GISKARD PUBKEY]"
+COMPROMISE_TAG         = "[GISKARD COMPROMISE_PROPOSAL]"
+GENESIS_ATTESTORS      = {"giskard-self", "lightning"}
+COMPROMISE_TTL_HOURS   = 24
+COMPROMISE_REQUIRED    = 2
+ROTATE_RATE_LIMIT_H    = 24
+REVOKE_RATE_LIMIT_H    = 24
+SIGNATURE_TTL_SECONDS  = 60
 
 
 def parse_registry_entry(text: str):
@@ -131,6 +167,145 @@ def parse_pubkey_entry(text: str):
         return json.loads(text[text.index("{"):])
     except:
         return None
+
+
+def parse_compromise_entry(text: str):
+    if COMPROMISE_TAG not in text:
+        return None
+    try:
+        return json.loads(text[text.index("{"):])
+    except:
+        return None
+
+
+def _ensure_epoch_fields(e: dict) -> dict:
+    """Backward compat: v0 entries without epoch/status are treated as epoch=1 active."""
+    if "epoch" not in e:
+        e["epoch"] = 1
+    if "status" not in e:
+        e["status"] = "active"
+    e.setdefault("rotated_at",        None)
+    e.setdefault("revoked_at",        None)
+    e.setdefault("revocation_reason", None)
+    e.setdefault("predecessor_epoch", None)
+    e.setdefault("rotation_proof",    None)
+    return e
+
+
+async def _fetch_agent_pubkey_entries(agent_id: str):
+    """Return all pubkey entries for an agent_id, oldest epoch first."""
+    raw = await mem_recall(PUBKEY_TAG, "pubkey-registry", n=500)
+    out = []
+    for part in raw.get("results", "").split("---"):
+        e = parse_pubkey_entry(part.strip())
+        if e and e.get("agent_id") == agent_id:
+            out.append(_ensure_epoch_fields(e))
+    # Deduplicate by epoch keeping the most informative copy
+    by_epoch: dict = {}
+    for e in out:
+        prev = by_epoch.get(e["epoch"])
+        if prev is None:
+            by_epoch[e["epoch"]] = e
+        else:
+            # Prefer the entry that already reflects rotation/revocation state
+            if prev.get("status") == "active" and e.get("status") != "active":
+                by_epoch[e["epoch"]] = e
+    return sorted(by_epoch.values(), key=lambda e: e["epoch"])
+
+
+async def _resolve_active(agent_id: str):
+    """Return the entry whose status == 'active'. None if the agent has no active key."""
+    for e in reversed(await _fetch_agent_pubkey_entries(agent_id)):
+        if e.get("status") == "active":
+            return e
+    return None
+
+
+def _active_at(entries: list, at_iso: str):
+    """Pick the entry that was active at a given ISO timestamp.
+    An entry was active at T if registered_at <= T AND (rotated_at > T or None)
+    AND (revoked_at > T or None)."""
+    best = None
+    best_epoch = -1
+    for e in entries:
+        reg = e.get("registered_at")
+        if not reg or reg > at_iso:
+            continue
+        rot = e.get("rotated_at")
+        if rot is not None and rot <= at_iso:
+            continue
+        rev = e.get("revoked_at")
+        if rev is not None and rev <= at_iso:
+            continue
+        if e["epoch"] > best_epoch:
+            best = e
+            best_epoch = e["epoch"]
+    return best
+
+
+def _verify_signature(pub_b64: str, payload_fields: dict, signature_b64: str) -> bool:
+    """Verify an Ed25519 signature over the canonical JSON of payload_fields."""
+    try:
+        import base64 as _b64
+        from nacl.signing import VerifyKey
+        from nacl.exceptions import BadSignatureError
+        payload = json.dumps(payload_fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        vk = VerifyKey(_b64.b64decode(pub_b64))
+        try:
+            vk.verify(payload, _b64.b64decode(signature_b64))
+            return True
+        except BadSignatureError:
+            return False
+    except Exception:
+        return False
+
+
+def _timestamp_fresh(ts: int) -> bool:
+    try:
+        return abs(int(time.time()) - int(ts)) <= SIGNATURE_TTL_SECONDS
+    except Exception:
+        return False
+
+
+async def _rate_limit_ok(agent_id: str, action: str, hours: int) -> bool:
+    """True if no matching action happened within the cooldown window. action in {'rotate','revoke'}."""
+    entries = await _fetch_agent_pubkey_entries(agent_id)
+    cutoff_ts = time.time() - hours * 3600
+    ts_field = "rotated_at" if action == "rotate" else "revoked_at"
+    for e in entries:
+        t = e.get(ts_field)
+        if not t:
+            continue
+        try:
+            ts = datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts >= cutoff_ts:
+            return False
+    return True
+
+
+async def _store_pubkey_entry(entry: dict):
+    content = f"{PUBKEY_TAG} {json.dumps(entry)}"
+    await mem_store(content, "pubkey-registry", {"agent_id": entry["agent_id"], "type": "pubkey", "epoch": entry["epoch"]})
+
+
+async def _fetch_compromise_proposals(agent_id: str):
+    raw = await mem_recall(COMPROMISE_TAG, "compromise-proposals", n=500)
+    out = []
+    for part in raw.get("results", "").split("---"):
+        e = parse_compromise_entry(part.strip())
+        if e and e.get("agent_id") == agent_id:
+            out.append(e)
+    # Keep the latest per proposed_at
+    out.sort(key=lambda e: e.get("proposed_at", ""))
+    return out
+
+
+async def _store_compromise_proposal(proposal: dict):
+    content = f"{COMPROMISE_TAG} {json.dumps(proposal)}"
+    await mem_store(content, "compromise-proposals",
+                    {"agent_id": proposal["agent_id"], "status": proposal["status"]})
 
 
 async def mem_store(content, agent_id, metadata=None):
@@ -363,14 +538,10 @@ async def registry_lookup(entity_id: str):
     }
 
 
-@app.post("/pubkey/register")
-async def pubkey_register(req: PubKeyRegisterRequest):
-    """Register an Ed25519 public key for an agent_id. First-write-wins:
-    once registered, the key is permanent (rotation is a future concern).
-    Used by karma_pricing.py to verify signed requests."""
+def _validate_pub_key(pub_key: str) -> None:
     import base64 as _b64
     try:
-        raw = _b64.b64decode(req.pub_key)
+        raw = _b64.b64decode(pub_key)
         if len(raw) != 32:
             raise HTTPException(400, "pub_key must be 32 bytes (Ed25519 verify key)")
     except HTTPException:
@@ -378,30 +549,264 @@ async def pubkey_register(req: PubKeyRegisterRequest):
     except Exception:
         raise HTTPException(400, "pub_key must be valid base64")
 
-    existing_raw = await mem_recall(PUBKEY_TAG, "pubkey-registry", n=500)
-    for part in existing_raw.get("results", "").split("---"):
-        e = parse_pubkey_entry(part.strip())
-        if e and e.get("agent_id") == req.agent_id:
-            if e.get("pub_key") == req.pub_key:
-                return {"status": "already_registered", "entry": e}
-            raise HTTPException(409, f"pub_key already registered for '{req.agent_id}'")
+
+@app.post("/pubkey/register")
+async def pubkey_register(req: PubKeyRegisterRequest):
+    """Register an Ed25519 public key for an agent_id. First-write-wins at epoch 1.
+    Further keys for the same agent must use /pubkey/rotate or /pubkey/revoke."""
+    _validate_pub_key(req.pub_key)
+
+    entries = await _fetch_agent_pubkey_entries(req.agent_id)
+    if entries:
+        current = entries[-1]
+        if current.get("pub_key") == req.pub_key and current.get("status") == "active":
+            return {"status": "already_registered", "entry": current}
+        raise HTTPException(409, f"pub_key history already exists for '{req.agent_id}'; use /pubkey/rotate")
 
     now = datetime.utcnow().isoformat()
-    entry = {"agent_id": req.agent_id, "pub_key": req.pub_key, "registered_at": now}
-    content = f"{PUBKEY_TAG} {json.dumps(entry)}"
-    await mem_store(content, "pubkey-registry", {"agent_id": req.agent_id, "type": "pubkey"})
+    entry = {
+        "agent_id":          req.agent_id,
+        "pub_key":           req.pub_key,
+        "epoch":             1,
+        "status":            "active",
+        "registered_at":     now,
+        "rotated_at":        None,
+        "revoked_at":        None,
+        "revocation_reason": None,
+        "predecessor_epoch": None,
+        "rotation_proof":    None,
+    }
+    await _store_pubkey_entry(entry)
     return {"status": "registered", "entry": entry}
 
 
 @app.get("/pubkey/{agent_id}")
-async def pubkey_lookup(agent_id: str):
-    """Return the Ed25519 pub_key registered for this agent_id, or 404."""
-    raw = await mem_recall(PUBKEY_TAG, "pubkey-registry", n=500)
-    for part in raw.get("results", "").split("---"):
-        e = parse_pubkey_entry(part.strip())
-        if e and e.get("agent_id") == agent_id:
-            return {"agent_id": agent_id, "pub_key": e["pub_key"], "registered_at": e.get("registered_at")}
-    raise HTTPException(404, f"No pub_key registered for '{agent_id}'")
+async def pubkey_lookup(agent_id: str, at_ts: Optional[int] = Query(default=None)):
+    """Return the Ed25519 pub_key that was active at the given Unix timestamp (default: now).
+    If the agent never registered — or no key was active at that timestamp — returns 404."""
+    entries = await _fetch_agent_pubkey_entries(agent_id)
+    if not entries:
+        raise HTTPException(404, f"No pub_key registered for '{agent_id}'")
+
+    if at_ts is None:
+        active = next((e for e in reversed(entries) if e.get("status") == "active"), None)
+        if not active:
+            raise HTTPException(404, f"No active pub_key for '{agent_id}' (all rotated or revoked)")
+        return {
+            "agent_id":      agent_id,
+            "pub_key":       active["pub_key"],
+            "epoch":         active["epoch"],
+            "status":        active["status"],
+            "registered_at": active.get("registered_at"),
+        }
+
+    iso = datetime.utcfromtimestamp(int(at_ts)).isoformat()
+    entry = _active_at(entries, iso)
+    if not entry:
+        raise HTTPException(404, f"No pub_key active for '{agent_id}' at {iso}")
+    return {
+        "agent_id":      agent_id,
+        "pub_key":       entry["pub_key"],
+        "epoch":         entry["epoch"],
+        "status":        entry["status"],
+        "registered_at": entry.get("registered_at"),
+    }
+
+
+@app.get("/pubkey/{agent_id}/history")
+async def pubkey_history(agent_id: str):
+    entries = await _fetch_agent_pubkey_entries(agent_id)
+    if not entries:
+        raise HTTPException(404, f"No pub_key history for '{agent_id}'")
+    return {"agent_id": agent_id, "epochs": entries}
+
+
+@app.get("/pubkey/{agent_id}/status")
+async def pubkey_status(agent_id: str):
+    entries = await _fetch_agent_pubkey_entries(agent_id)
+    if not entries:
+        return {"agent_id": agent_id, "status": "no_key", "current_epoch": None}
+    active = next((e for e in reversed(entries) if e.get("status") == "active"), None)
+    if active:
+        return {"agent_id": agent_id, "status": "active", "current_epoch": active["epoch"]}
+    # No active — report the most advanced terminal state
+    terminal = max(entries, key=lambda e: e["epoch"])
+    return {
+        "agent_id":      agent_id,
+        "status":        terminal.get("status"),
+        "current_epoch": terminal["epoch"],
+        "reason":        terminal.get("revocation_reason"),
+    }
+
+
+@app.post("/pubkey/rotate")
+async def pubkey_rotate(req: PubKeyRotateRequest):
+    """Rotate to a new pub_key. Caller must prove possession of the current active
+    private key by signing the canonical payload {agent_id, new_pub_key, timestamp, nonce, action='rotate'}."""
+    _validate_pub_key(req.new_pub_key)
+    if not _timestamp_fresh(req.timestamp):
+        raise HTTPException(400, "timestamp outside acceptable window")
+
+    current = await _resolve_active(req.agent_id)
+    if not current:
+        raise HTTPException(404, f"No active pub_key for '{req.agent_id}' — register first")
+    if current["pub_key"] == req.new_pub_key:
+        raise HTTPException(400, "new_pub_key must differ from current active key")
+
+    if not await _rate_limit_ok(req.agent_id, "rotate", ROTATE_RATE_LIMIT_H):
+        raise HTTPException(429, f"rotate rate limit: max 1 per {ROTATE_RATE_LIMIT_H}h")
+
+    payload = {
+        "agent_id":    req.agent_id,
+        "new_pub_key": req.new_pub_key,
+        "timestamp":   int(req.timestamp),
+        "nonce":       req.nonce,
+        "action":      "rotate",
+    }
+    if not _verify_signature(current["pub_key"], payload, req.rotation_proof):
+        raise HTTPException(403, "rotation_proof did not verify against current active pub_key")
+
+    now = datetime.utcnow().isoformat()
+
+    # Mark the old entry as rotated (append-only: write a superseding record)
+    rotated_old = {**current, "status": "rotated", "rotated_at": now}
+    await _store_pubkey_entry(rotated_old)
+
+    new_epoch = current["epoch"] + 1
+    new_entry = {
+        "agent_id":          req.agent_id,
+        "pub_key":           req.new_pub_key,
+        "epoch":             new_epoch,
+        "status":            "active",
+        "registered_at":     now,
+        "rotated_at":        None,
+        "revoked_at":        None,
+        "revocation_reason": None,
+        "predecessor_epoch": current["epoch"],
+        "rotation_proof":    req.rotation_proof,
+    }
+    await _store_pubkey_entry(new_entry)
+    return {"status": "rotated", "new_epoch": new_epoch, "new_pub_key": req.new_pub_key}
+
+
+@app.post("/pubkey/revoke")
+async def pubkey_revoke(req: PubKeyRevokeRequest):
+    """Voluntary revocation. Requires a signature with the current active private key
+    over {agent_id, action='revoke', timestamp, nonce}."""
+    if not _timestamp_fresh(req.timestamp):
+        raise HTTPException(400, "timestamp outside acceptable window")
+
+    current = await _resolve_active(req.agent_id)
+    if not current:
+        raise HTTPException(404, f"No active pub_key for '{req.agent_id}'")
+
+    if not await _rate_limit_ok(req.agent_id, "revoke", REVOKE_RATE_LIMIT_H):
+        raise HTTPException(429, f"revoke rate limit: max 1 per {REVOKE_RATE_LIMIT_H}h")
+
+    payload = {
+        "agent_id":  req.agent_id,
+        "action":    "revoke",
+        "timestamp": int(req.timestamp),
+        "nonce":     req.nonce,
+    }
+    if not _verify_signature(current["pub_key"], payload, req.signature):
+        raise HTTPException(403, "signature did not verify against current active pub_key")
+
+    now = datetime.utcnow().isoformat()
+    revoked = {**current, "status": "revoked", "revoked_at": now, "revocation_reason": "voluntary"}
+    await _store_pubkey_entry(revoked)
+    return {"status": "revoked", "epoch": current["epoch"]}
+
+
+@app.post("/pubkey/report-compromise")
+async def pubkey_report_compromise(req: CompromiseReportRequest):
+    """Open a compromise proposal for an agent whose private key is believed stolen/lost.
+    Needs COMPROMISE_REQUIRED genesis attestations within COMPROMISE_TTL_HOURS to revoke."""
+    current = await _resolve_active(req.agent_id)
+    if not current:
+        raise HTTPException(404, f"No active pub_key for '{req.agent_id}' — nothing to revoke")
+
+    now_dt = datetime.utcnow()
+    proposals = await _fetch_compromise_proposals(req.agent_id)
+    for p in proposals:
+        if p.get("status") == "pending":
+            expires = p.get("expires_at")
+            if expires and expires > now_dt.isoformat():
+                raise HTTPException(409, "a pending compromise proposal already exists for this agent")
+
+    proposal = {
+        "agent_id":     req.agent_id,
+        "proposed_by":  req.reporter_agent_id,
+        "proposed_at":  now_dt.isoformat(),
+        "expires_at":   (now_dt + timedelta(hours=COMPROMISE_TTL_HOURS)).isoformat(),
+        "attestations": [],
+        "status":       "pending",
+    }
+    await _store_compromise_proposal(proposal)
+    return {
+        "status":                 "pending",
+        "expires_at":             proposal["expires_at"],
+        "required_attestations":  COMPROMISE_REQUIRED,
+    }
+
+
+@app.post("/pubkey/compromise/attest")
+async def pubkey_compromise_attest(req: CompromiseAttestRequest):
+    """Genesis attestor confirms a compromise proposal. When COMPROMISE_REQUIRED
+    distinct attestations land, the victim's current key is revoked (reason='compromise')."""
+    if req.attestor not in GENESIS_ATTESTORS:
+        raise HTTPException(403, "only genesis attestors can confirm a compromise proposal")
+    if not _timestamp_fresh(req.timestamp):
+        raise HTTPException(400, "timestamp outside acceptable window")
+
+    attestor_key = await _resolve_active(req.attestor)
+    if not attestor_key:
+        raise HTTPException(404, f"attestor '{req.attestor}' has no active pub_key")
+
+    payload = {
+        "proposal_agent_id": req.proposal_agent_id,
+        "action":            "compromise",
+        "timestamp":         int(req.timestamp),
+        "nonce":             req.nonce,
+    }
+    if not _verify_signature(attestor_key["pub_key"], payload, req.signature):
+        raise HTTPException(403, "signature did not verify against attestor's active pub_key")
+
+    proposals = await _fetch_compromise_proposals(req.proposal_agent_id)
+    active = [p for p in proposals if p.get("status") == "pending"]
+    if not active:
+        raise HTTPException(404, "no pending compromise proposal for this agent")
+    now_dt = datetime.utcnow()
+    active = [p for p in active if (p.get("expires_at") or "") > now_dt.isoformat()]
+    if not active:
+        raise HTTPException(410, "compromise proposal expired")
+    proposal = active[-1]
+
+    if any(a.get("from") == req.attestor for a in proposal.get("attestations", [])):
+        raise HTTPException(409, f"attestor '{req.attestor}' already signed this proposal")
+
+    proposal.setdefault("attestations", []).append({
+        "from":      req.attestor,
+        "signature": req.signature,
+        "at":        now_dt.isoformat(),
+    })
+
+    confirmed = len(proposal["attestations"]) >= COMPROMISE_REQUIRED
+    if confirmed:
+        proposal["status"] = "confirmed"
+        victim = await _resolve_active(req.proposal_agent_id)
+        if victim:
+            revoked = {**victim, "status": "revoked",
+                       "revoked_at": now_dt.isoformat(),
+                       "revocation_reason": "compromise"}
+            await _store_pubkey_entry(revoked)
+
+    await _store_compromise_proposal(proposal)
+    return {
+        "status":               "confirmed" if confirmed else "attested",
+        "attestations_count":   len(proposal["attestations"]),
+        "required":             COMPROMISE_REQUIRED,
+    }
 
 
 @app.get("/status")

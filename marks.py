@@ -140,12 +140,31 @@ class CompromiseAttestRequest(BaseModel):
     signature:         str     # attestor signs with their own active key
 
 
+class RecoveryProposalRequest(BaseModel):
+    agent_id:     str          # victim, currently in revoked-compromise state
+    new_pub_key:  str          # base64 Ed25519 verify key the victim wants to bind
+    proposed_by:  str          # whoever raises the recovery (can be victim)
+
+
+class RecoveryAttestRequest(BaseModel):
+    proposal_agent_id: str     # victim agent_id
+    new_pub_key:       str     # MUST match the proposal's new_pub_key
+    attestor:          str     # genesis attestor agent_id
+    timestamp:         int
+    nonce:             str
+    signature:         str     # attestor signs canonical {proposal_agent_id, new_pub_key,
+                               # action='recover', timestamp, nonce} with their active key
+
+
 REGISTRY_TAG           = "[GISKARD REGISTRY]"
 PUBKEY_TAG             = "[GISKARD PUBKEY]"
 COMPROMISE_TAG         = "[GISKARD COMPROMISE_PROPOSAL]"
+RECOVERY_TAG           = "[GISKARD RECOVERY_PROPOSAL]"
 GENESIS_ATTESTORS      = {"giskard-self", "lightning"}
 COMPROMISE_TTL_HOURS   = 24
 COMPROMISE_REQUIRED    = 2
+RECOVERY_TTL_HOURS     = 24
+RECOVERY_REQUIRED      = 2
 ROTATE_RATE_LIMIT_H    = 24
 REVOKE_RATE_LIMIT_H    = 24
 SIGNATURE_TTL_SECONDS  = 60
@@ -171,6 +190,15 @@ def parse_pubkey_entry(text: str):
 
 def parse_compromise_entry(text: str):
     if COMPROMISE_TAG not in text:
+        return None
+    try:
+        return json.loads(text[text.index("{"):])
+    except:
+        return None
+
+
+def parse_recovery_entry(text: str):
+    if RECOVERY_TAG not in text:
         return None
     try:
         return json.loads(text[text.index("{"):])
@@ -305,6 +333,23 @@ async def _fetch_compromise_proposals(agent_id: str):
 async def _store_compromise_proposal(proposal: dict):
     content = f"{COMPROMISE_TAG} {json.dumps(proposal)}"
     await mem_store(content, "compromise-proposals",
+                    {"agent_id": proposal["agent_id"], "status": proposal["status"]})
+
+
+async def _fetch_recovery_proposals(agent_id: str):
+    raw = await mem_recall(RECOVERY_TAG, "recovery-proposals", n=500)
+    out = []
+    for part in raw.get("results", "").split("---"):
+        e = parse_recovery_entry(part.strip())
+        if e and e.get("agent_id") == agent_id:
+            out.append(e)
+    out.sort(key=lambda e: e.get("proposed_at", ""))
+    return out
+
+
+async def _store_recovery_proposal(proposal: dict):
+    content = f"{RECOVERY_TAG} {json.dumps(proposal)}"
+    await mem_store(content, "recovery-proposals",
                     {"agent_id": proposal["agent_id"], "status": proposal["status"]})
 
 
@@ -806,6 +851,161 @@ async def pubkey_compromise_attest(req: CompromiseAttestRequest):
         "status":               "confirmed" if confirmed else "attested",
         "attestations_count":   len(proposal["attestations"]),
         "required":             COMPROMISE_REQUIRED,
+    }
+
+
+@app.post("/pubkey/recover/propose")
+async def pubkey_recover_propose(req: RecoveryProposalRequest):
+    """Open a recovery proposal for an agent whose latest epoch is revoked-compromise.
+    The victim has lost their private key, so this call carries no signature — the
+    legitimacy comes from the genesis attestations that follow."""
+    _validate_pub_key(req.new_pub_key)
+
+    entries = await _fetch_agent_pubkey_entries(req.agent_id)
+    if not entries:
+        raise HTTPException(404, f"No pub_key history for '{req.agent_id}'")
+    terminal = max(entries, key=lambda e: e["epoch"])
+    if terminal.get("status") != "revoked" or terminal.get("revocation_reason") != "compromise":
+        raise HTTPException(
+            400,
+            f"agent '{req.agent_id}' is not in revoked-compromise state — "
+            "recovery is only allowed after a confirmed compromise",
+        )
+
+    if any(e.get("pub_key") == req.new_pub_key for e in entries):
+        raise HTTPException(400, "new_pub_key collides with a key already in this agent's history")
+
+    now_dt = datetime.utcnow()
+    proposals = await _fetch_recovery_proposals(req.agent_id)
+    for p in proposals:
+        if p.get("status") == "pending":
+            expires = p.get("expires_at")
+            if expires and expires > now_dt.isoformat():
+                raise HTTPException(409, "a pending recovery proposal already exists for this agent")
+
+    proposal = {
+        "agent_id":     req.agent_id,
+        "new_pub_key":  req.new_pub_key,
+        "proposed_by":  req.proposed_by,
+        "proposed_at":  now_dt.isoformat(),
+        "expires_at":   (now_dt + timedelta(hours=RECOVERY_TTL_HOURS)).isoformat(),
+        "attestations": [],
+        "status":       "pending",
+        "revoked_epoch": terminal["epoch"],
+    }
+    await _store_recovery_proposal(proposal)
+    return {
+        "status":                 "pending",
+        "expires_at":             proposal["expires_at"],
+        "required_attestations":  RECOVERY_REQUIRED,
+        "new_pub_key":            req.new_pub_key,
+        "revoked_epoch":          terminal["epoch"],
+    }
+
+
+@app.post("/pubkey/recover/attest")
+async def pubkey_recover_attest(req: RecoveryAttestRequest):
+    """Genesis attestor confirms a recovery proposal. When RECOVERY_REQUIRED distinct
+    attestations land, a new active epoch is materialized for the victim with the
+    proposed new_pub_key."""
+    if req.attestor not in GENESIS_ATTESTORS:
+        raise HTTPException(403, "only genesis attestors can confirm a recovery proposal")
+    if not _timestamp_fresh(req.timestamp):
+        raise HTTPException(400, "timestamp outside acceptable window")
+
+    attestor_key = await _resolve_active(req.attestor)
+    if not attestor_key:
+        raise HTTPException(404, f"attestor '{req.attestor}' has no active pub_key")
+
+    payload = {
+        "proposal_agent_id": req.proposal_agent_id,
+        "new_pub_key":       req.new_pub_key,
+        "action":            "recover",
+        "timestamp":         int(req.timestamp),
+        "nonce":             req.nonce,
+    }
+    if not _verify_signature(attestor_key["pub_key"], payload, req.signature):
+        raise HTTPException(403, "signature did not verify against attestor's active pub_key")
+
+    proposals = await _fetch_recovery_proposals(req.proposal_agent_id)
+    pending = [p for p in proposals if p.get("status") == "pending"]
+    if not pending:
+        raise HTTPException(404, "no pending recovery proposal for this agent")
+    now_dt = datetime.utcnow()
+    pending = [p for p in pending if (p.get("expires_at") or "") > now_dt.isoformat()]
+    if not pending:
+        raise HTTPException(410, "recovery proposal expired")
+    proposal = pending[-1]
+
+    if proposal.get("new_pub_key") != req.new_pub_key:
+        raise HTTPException(409, "attestation new_pub_key does not match the pending proposal")
+
+    if any(a.get("from") == req.attestor for a in proposal.get("attestations", [])):
+        raise HTTPException(409, f"attestor '{req.attestor}' already signed this proposal")
+
+    proposal.setdefault("attestations", []).append({
+        "from":      req.attestor,
+        "signature": req.signature,
+        "at":        now_dt.isoformat(),
+    })
+
+    confirmed = len(proposal["attestations"]) >= RECOVERY_REQUIRED
+    new_epoch = None
+    if confirmed:
+        proposal["status"] = "confirmed"
+        entries = await _fetch_agent_pubkey_entries(req.proposal_agent_id)
+        terminal = max(entries, key=lambda e: e["epoch"]) if entries else None
+        if not terminal:
+            raise HTTPException(500, "internal: pubkey history vanished mid-recovery")
+        new_epoch = terminal["epoch"] + 1
+        recovered_entry = {
+            "agent_id":          req.proposal_agent_id,
+            "pub_key":           req.new_pub_key,
+            "epoch":             new_epoch,
+            "status":            "active",
+            "registered_at":     now_dt.isoformat(),
+            "rotated_at":        None,
+            "revoked_at":        None,
+            "revocation_reason": None,
+            "predecessor_epoch": terminal["epoch"],
+            "rotation_proof":    None,
+            "recovered_via":     "genesis_attestation",
+        }
+        await _store_pubkey_entry(recovered_entry)
+
+    await _store_recovery_proposal(proposal)
+    return {
+        "status":               "confirmed" if confirmed else "attested",
+        "attestations_count":   len(proposal["attestations"]),
+        "required":             RECOVERY_REQUIRED,
+        "new_epoch":            new_epoch,
+    }
+
+
+@app.get("/pubkey/{agent_id}/recovery")
+async def pubkey_recovery_status(agent_id: str):
+    """Inspect the latest recovery proposal for an agent_id (pending/confirmed/expired)."""
+    proposals = await _fetch_recovery_proposals(agent_id)
+    if not proposals:
+        return {"agent_id": agent_id, "proposal": None}
+    latest = proposals[-1]
+    now_iso = datetime.utcnow().isoformat()
+    if latest.get("status") == "pending" and (latest.get("expires_at") or "") <= now_iso:
+        view_status = "expired"
+    else:
+        view_status = latest.get("status")
+    return {
+        "agent_id": agent_id,
+        "proposal": {
+            "new_pub_key":         latest.get("new_pub_key"),
+            "proposed_by":         latest.get("proposed_by"),
+            "proposed_at":         latest.get("proposed_at"),
+            "expires_at":          latest.get("expires_at"),
+            "status":              view_status,
+            "attestations_count":  len(latest.get("attestations", [])),
+            "required":            RECOVERY_REQUIRED,
+            "revoked_epoch":       latest.get("revoked_epoch"),
+        },
     }
 
 

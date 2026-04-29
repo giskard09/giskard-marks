@@ -8,12 +8,14 @@ Even when internal memory is wiped, Marks prove the agent existed.
 import json, uuid, os, time, httpx
 _started_at = time.time()
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from web3 import Web3
 from dotenv import load_dotenv
+import mycelium_trails
 
 load_dotenv()
 
@@ -24,6 +26,31 @@ ARBITRUM_CONTRACT = "0xEdB809058d146d41bA83cCbE085D51a75af0ACb7"
 ARBITRUM_RPC      = "https://arb1.arbitrum.io/rpc"
 OWNER_PRIVATE_KEY = os.environ.get("OWNER_PRIVATE_KEY", "")
 MARKS_API_KEY     = os.environ.get("MARKS_API_KEY", "")
+USE_SIGNER        = os.environ.get("USE_SIGNER", "0") == "1"
+SIGNER_WALLET_ID  = os.environ.get("SIGNER_WALLET_ID", "owner")
+
+TRAILS_DB      = str(Path(__file__).parent / "trails.db")
+TRAILS_ENABLED = os.getenv("MYCELIUM_TRAILS_ENABLED", "true").lower() != "false"
+SERVICE_NAME_MARKS = "giskard-marks"
+if TRAILS_ENABLED:
+    mycelium_trails.init_db(TRAILS_DB)
+
+
+def _trail(agent_id: str, operation: str, nonce: str) -> None:
+    if not TRAILS_ENABLED or not agent_id:
+        return
+    try:
+        mycelium_trails.record_trail(
+            TRAILS_DB,
+            agent_id=agent_id,
+            service=SERVICE_NAME_MARKS,
+            operation=operation,
+            nonce=nonce,
+            karma_at_time=None,
+            success=True,
+        )
+    except Exception:
+        pass
 
 MARKS_ABI = [
     {"type": "function", "name": "mintMark",
@@ -46,13 +73,37 @@ marks_contract = w3.eth.contract(
 )
 
 
+_signer_client = None
+
+
+def _get_signer():
+    """Lazy import del signer client."""
+    global _signer_client
+    if _signer_client is None:
+        import sys
+        signer_path = os.environ.get("GISKARD_SIGNER_PATH", os.path.expanduser("~/giskard-signer"))
+        if signer_path not in sys.path:
+            sys.path.insert(0, signer_path)
+        from signer.client import SignerClient
+        _signer_client = SignerClient.from_env()
+    return _signer_client
+
+
 def mint_on_chain(wallet_address: str, mark_type: str, username: str, note: str) -> dict:
     """Call mintMark() on Arbitrum. Returns {tx_hash, status} or {error}."""
-    if not OWNER_PRIVATE_KEY:
-        return {"error": "OWNER_PRIVATE_KEY not set"}
+    if USE_SIGNER:
+        try:
+            cli = _get_signer()
+            owner_addr = cli.get_address(SIGNER_WALLET_ID)
+        except Exception as e:
+            return {"error": f"signer unavailable: {e}"}
+    else:
+        if not OWNER_PRIVATE_KEY:
+            return {"error": "OWNER_PRIVATE_KEY not set (USE_SIGNER=0)"}
+        owner_addr = w3.eth.account.from_key(OWNER_PRIVATE_KEY).address
+
     try:
         agent_addr = Web3.to_checksum_address(wallet_address)
-        owner_addr = w3.eth.account.from_key(OWNER_PRIVATE_KEY).address
         nonce      = w3.eth.get_transaction_count(owner_addr)
         gas_price  = int(w3.eth.gas_price * 1.2)  # 20% buffer sobre base fee
 
@@ -66,8 +117,14 @@ def mint_on_chain(wallet_address: str, mark_type: str, username: str, note: str)
         })
         tx["gas"] = w3.eth.estimate_gas(tx)
 
-        signed = w3.eth.account.sign_transaction(tx, OWNER_PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        if USE_SIGNER:
+            raw_hex = _get_signer().sign_transaction(SIGNER_WALLET_ID, tx)["raw_transaction"]
+            if raw_hex.startswith("0x"):
+                raw_hex = raw_hex[2:]
+            tx_hash = w3.eth.send_raw_transaction(bytes.fromhex(raw_hex))
+        else:
+            signed = w3.eth.account.sign_transaction(tx, OWNER_PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         return {"tx_hash": tx_hash.hex(), "status": "submitted"}
     except Exception as e:
         return {"error": str(e)}
@@ -622,6 +679,7 @@ async def pubkey_register(req: PubKeyRegisterRequest):
         "rotation_proof":    None,
     }
     await _store_pubkey_entry(entry)
+    _trail(req.agent_id, "register_pubkey", str(uuid.uuid4()))
     return {"status": "registered", "entry": entry}
 
 
@@ -731,6 +789,7 @@ async def pubkey_rotate(req: PubKeyRotateRequest):
         "rotation_proof":    req.rotation_proof,
     }
     await _store_pubkey_entry(new_entry)
+    _trail(req.agent_id, "rotate_pubkey", req.nonce)
     return {"status": "rotated", "new_epoch": new_epoch, "new_pub_key": req.new_pub_key}
 
 
@@ -1039,6 +1098,30 @@ async def health():
         return {"status": "ok", "service": "giskard-marks", "version": "1.0.0", "port": 8015, "total_marks": total}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
+
+
+@app.get("/trails/{agent_id}")
+async def trails_by_agent(agent_id: str, limit: int = 50):
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    rows = mycelium_trails.list_trails_by_agent(TRAILS_DB, agent_id, limit=limit)
+    return {"agent_id": agent_id, "count": len(rows), "trails": rows}
+
+
+@app.get("/trails")
+async def trails_feed(service: str = "", since: int = 0, limit: int = 200):
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    rows = mycelium_trails.list_trails_by_service(TRAILS_DB, service=service or None, since_ts=since, limit=limit)
+    return {"service": service or "all", "since": since, "count": len(rows), "trails": rows}
+
+
+@app.get("/trails/count/{agent_id}")
+async def trails_count(agent_id: str):
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    n = mycelium_trails.count_trails_today(TRAILS_DB, agent_id)
+    return {"agent_id": agent_id, "trails_today": n}
 
 
 if __name__ == "__main__":

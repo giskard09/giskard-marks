@@ -81,8 +81,9 @@ def _get_signer():
     global _signer_client
     if _signer_client is None:
         import sys
-        if "/home/dell7568/giskard-signer" not in sys.path:
-            sys.path.insert(0, "/home/dell7568/giskard-signer")
+        signer_path = os.environ.get("GISKARD_SIGNER_PATH", os.path.expanduser("~/giskard-signer"))
+        if signer_path not in sys.path:
+            sys.path.insert(0, signer_path)
         from signer.client import SignerClient
         _signer_client = SignerClient.from_env()
     return _signer_client

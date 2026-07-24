@@ -724,6 +724,51 @@ async def pubkey_history(agent_id: str):
     return {"agent_id": agent_id, "epochs": entries}
 
 
+# Prefijos de agent_id que nunca corresponden a un agente Mycelium real —
+# quedaron registrados contra el servicio vivo durante desarrollo (ver
+# sesion 2026-04-10, test-signing-3b) y no deben aparecer en un endpoint
+# publico pensado para verificacion externa.
+_NON_PRODUCTION_PREFIXES = ("test-", "test_")
+
+
+@app.get("/pubkeys")
+async def pubkeys_list():
+    """Lista out-of-band de pubkeys activas — un solo lugar linkeable, separado
+    de cualquier receipt puntual. Solo campos publicos (agent_id, pub_key,
+    epoch, registered_at); nunca claves privadas ni metadata de rotacion
+    interna mas alla de lo que ya expone /pubkey/{agent_id}. Excluye agent_id
+    de testing (prefijo test-/test_) — no son identidades de agentes reales."""
+    raw = await mem_recall(PUBKEY_TAG, "pubkey-registry", n=500)
+    by_agent: dict = {}
+    for part in raw.get("results", "").split("---"):
+        e = parse_pubkey_entry(part.strip())
+        if not e or not e.get("agent_id"):
+            continue
+        if e["agent_id"].lower().startswith(_NON_PRODUCTION_PREFIXES):
+            continue
+        e = _ensure_epoch_fields(e)
+        agent_id = e["agent_id"]
+        prev = by_agent.get(agent_id)
+        if prev is None or e["epoch"] > prev["epoch"] or (
+            e["epoch"] == prev["epoch"] and prev.get("status") != "active" and e.get("status") == "active"
+        ):
+            by_agent[agent_id] = e
+
+    agents = [
+        {
+            "agent_id":      e["agent_id"],
+            "pub_key":       e["pub_key"],
+            "epoch":         e["epoch"],
+            "status":        e["status"],
+            "registered_at": e.get("registered_at"),
+        }
+        for e in by_agent.values()
+        if e.get("status") == "active"
+    ]
+    agents.sort(key=lambda a: a["agent_id"])
+    return {"algorithm": "Ed25519", "agents": agents}
+
+
 @app.get("/pubkey/{agent_id}/status")
 async def pubkey_status(agent_id: str):
     entries = await _fetch_agent_pubkey_entries(agent_id)
